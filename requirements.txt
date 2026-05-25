@@ -9,3 +9,4 @@ faiss-cpu
 pypdf
 pillow
 moviepy
+langgraph

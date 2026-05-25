@@ -18,6 +18,9 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.vectorstores import FAISS
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
+from typing import TypedDict, Optional, Any
+from langgraph.graph import StateGraph, END
+
 
 # ---------------- LOAD ENV ----------------
 
@@ -169,6 +172,158 @@ def process_pdf(pdf_path):
     return vectorstore
 
 
+
+# ---------------- LANGGRAPH WORKFLOW ----------------
+
+class AppState(TypedDict):
+    user_input: str
+    file_type: Optional[str]
+    vectorstore: Any
+    media_file: Any
+    ai_reply: str
+
+
+def route_question(state: AppState) -> str:
+    """Decide which node should handle the user question."""
+
+    if state["file_type"] == "application/pdf" and state["vectorstore"] is not None:
+        return "pdf"
+
+    if state["media_file"] is not None:
+        return "media"
+
+    return "agent"
+
+
+def pdf_node(state: AppState) -> AppState:
+    """Answer questions from uploaded PDF using RAG."""
+
+    try:
+        docs = state["vectorstore"].similarity_search(
+            state["user_input"],
+            k=4
+        )
+
+        context = "\n\n".join(
+            [doc.page_content for doc in docs]
+        )
+
+        prompt = f"""
+You are a PDF assistant.
+
+Answer ONLY from the PDF context below.
+
+If answer is not found,
+say:
+"Answer not clearly found in PDF."
+
+PDF Context:
+{context}
+
+Question:
+{state["user_input"]}
+"""
+
+        response = chat_model.invoke(prompt)
+        state["ai_reply"] = response.content
+
+    except Exception as e:
+        error_text = str(e)
+
+        if "RESOURCE_EXHAUSTED" in error_text or "429" in error_text or "quota" in error_text.lower():
+            state["ai_reply"] = (
+                "Gemini free-tier quota is exhausted right now. "
+                "Wait for the retry time shown in terminal, use a smaller PDF, "
+                "or switch to another API key/billing-enabled project."
+            )
+        else:
+            state["ai_reply"] = f"PDF answer error: {e}"
+
+    return state
+
+
+def media_node(state: AppState) -> AppState:
+    """Answer questions about uploaded image, audio, or video."""
+
+    try:
+        response = media_model.generate_content([
+            state["media_file"],
+            state["user_input"]
+        ])
+
+        state["ai_reply"] = response.text
+
+    except Exception as e:
+        error_text = str(e)
+
+        if "RESOURCE_EXHAUSTED" in error_text or "429" in error_text or "quota" in error_text.lower():
+            state["ai_reply"] = (
+                "Gemini free-tier quota is exhausted right now. "
+                "Wait for the retry time shown in terminal, use fewer requests, upload a smaller file, "
+                "or switch to another API key/billing-enabled project."
+            )
+        else:
+            state["ai_reply"] = f"Media analysis error: {e}"
+
+    return state
+
+
+def agent_node(state: AppState) -> AppState:
+    """Use the LangChain agent with calculator and notes tools."""
+
+    try:
+        response = agent.invoke({
+            "messages": st.session_state["messages"]
+        })
+
+        last_message = response["messages"][-1]
+
+        try:
+            state["ai_reply"] = last_message.text
+
+        except Exception:
+            try:
+                state["ai_reply"] = last_message.content[0]["text"]
+
+            except Exception:
+                state["ai_reply"] = str(last_message.content)
+
+    except Exception as e:
+        error_text = str(e)
+
+        if "RESOURCE_EXHAUSTED" in error_text or "429" in error_text or "quota" in error_text.lower():
+            state["ai_reply"] = (
+                "Gemini free-tier quota is exhausted right now. "
+                "Wait for the retry time shown in terminal, reduce requests, "
+                "or switch to another API key/billing-enabled project."
+            )
+        else:
+            state["ai_reply"] = f"Chat error: {e}"
+
+    return state
+
+
+workflow = StateGraph(AppState)
+
+workflow.add_node("pdf", pdf_node)
+workflow.add_node("media", media_node)
+workflow.add_node("agent", agent_node)
+
+workflow.set_conditional_entry_point(
+    route_question,
+    {
+        "pdf": "pdf",
+        "media": "media",
+        "agent": "agent"
+    }
+)
+
+workflow.add_edge("pdf", END)
+workflow.add_edge("media", END)
+workflow.add_edge("agent", END)
+
+app_graph = workflow.compile()
+
 # ---------------- WAIT FOR MEDIA ----------------
 
 def wait_for_media(file):
@@ -317,113 +472,17 @@ if user_input:
     vectorstore = st.session_state.get("vectorstore")
     media_file = st.session_state.get("media_file")
 
-    ai_reply = ""
+    graph_input = {
+        "user_input": user_input,
+        "file_type": file_type,
+        "vectorstore": vectorstore,
+        "media_file": media_file,
+        "ai_reply": ""
+    }
 
-    # ---------- PDF RAG ----------
+    graph_result = app_graph.invoke(graph_input)
 
-    if (
-        file_type == "application/pdf"
-        and vectorstore is not None
-    ):
-
-        docs = vectorstore.similarity_search(
-            user_input,
-            k=4
-        )
-
-        context = "\n\n".join(
-            [doc.page_content for doc in docs]
-        )
-
-        prompt = f"""
-You are a PDF assistant.
-
-Answer ONLY from the PDF context below.
-
-If answer is not found,
-say:
-"Answer not clearly found in PDF."
-
-PDF Context:
-{context}
-
-Question:
-{user_input}
-"""
-
-        try:
-            response = chat_model.invoke(prompt)
-            ai_reply = response.content
-
-        except Exception as e:
-            error_text = str(e)
-
-            if "RESOURCE_EXHAUSTED" in error_text or "429" in error_text or "quota" in error_text.lower():
-                ai_reply = (
-                    "Gemini free-tier quota is exhausted right now. "
-                    "Wait for the retry time shown in terminal, use a smaller PDF, "
-                    "or switch to another API key/billing-enabled project."
-                )
-            else:
-                ai_reply = f"PDF answer error: {e}"
-
-    # ---------- IMAGE / AUDIO / VIDEO ----------
-
-    elif media_file is not None:
-
-        try:
-            response = media_model.generate_content([
-                media_file,
-                user_input
-            ])
-
-            ai_reply = response.text
-
-        except Exception as e:
-            error_text = str(e)
-
-            if "RESOURCE_EXHAUSTED" in error_text or "429" in error_text or "quota" in error_text.lower():
-                ai_reply = (
-                    "Gemini free-tier quota is exhausted right now. "
-                    "Wait for the retry time shown in terminal, use fewer requests, upload a smaller file, "
-                    "or switch to another API key/billing-enabled project."
-                )
-            else:
-                ai_reply = f"Media analysis error: {e}"
-
-    # ---------- NORMAL CHAT / TOOLS ----------
-
-    else:
-
-        try:
-            response = agent.invoke({
-                "messages": st.session_state["messages"]
-            })
-
-            last_message = response["messages"][-1]
-
-            try:
-                ai_reply = last_message.text
-
-            except Exception:
-
-                try:
-                    ai_reply = last_message.content[0]["text"]
-
-                except Exception:
-                    ai_reply = str(last_message.content)
-
-        except Exception as e:
-            error_text = str(e)
-
-            if "RESOURCE_EXHAUSTED" in error_text or "429" in error_text or "quota" in error_text.lower():
-                ai_reply = (
-                    "Gemini free-tier quota is exhausted right now. "
-                    "Wait for the retry time shown in terminal, reduce requests, "
-                    "or switch to another API key/billing-enabled project."
-                )
-            else:
-                ai_reply = f"Chat error: {e}"
+    ai_reply = graph_result["ai_reply"]
 
     # ---------- SAVE CHAT ----------
 
