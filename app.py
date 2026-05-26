@@ -39,7 +39,7 @@ st.set_page_config(
 )
 
 st.title("🤖 AI Multi Agent")
-st.write("Chat + PDF + Image + Audio + Video + Notes + Calculator")
+st.write("Chat + PDF + Image + Audio + Video + Product Analysis + Notes + Calculator")
 
 
 # ---------------- SESSION STATE ----------------
@@ -181,13 +181,39 @@ class AppState(TypedDict):
     vectorstore: Any
     media_file: Any
     ai_reply: str
+    product_mode: bool
 
 
 def route_question(state: AppState) -> str:
     """Decide which node should handle the user question."""
 
+    user_text = state["user_input"].lower()
+
+    product_keywords = [
+        "product",
+        "competitor",
+        "compare",
+        "comparison",
+        "alternative",
+        "alternatives",
+        "brand",
+        "features",
+        "specifications",
+        "shoe",
+        "phone",
+        "laptop",
+        "watch",
+        "headphone"
+    ]
+
     if state["file_type"] == "application/pdf" and state["vectorstore"] is not None:
         return "pdf"
+
+    if (
+        state["media_file"] is not None
+        and any(keyword in user_text for keyword in product_keywords)
+    ):
+        return "product"
 
     if state["media_file"] is not None:
         return "media"
@@ -268,6 +294,47 @@ def media_node(state: AppState) -> AppState:
     return state
 
 
+def product_node(state: AppState) -> AppState:
+    """Analyze products from uploaded images and provide competitors."""
+
+    try:
+        response = media_model.generate_content([
+            state["media_file"],
+            """
+            Analyze this product image carefully.
+
+            Give the answer in this format:
+
+            Product Name:
+            Brand:
+            Category:
+            Description:
+            Key Features:
+            Main Competitors:
+            Similar Alternatives:
+            Best Use Case:
+
+            If product is unclear, still try your best.
+            """
+        ])
+
+        state["ai_reply"] = response.text
+
+    except Exception as e:
+        error_text = str(e)
+
+        if "RESOURCE_EXHAUSTED" in error_text or "429" in error_text or "quota" in error_text.lower():
+            state["ai_reply"] = (
+                "Gemini free-tier quota is exhausted right now. "
+                "Wait for the retry time shown in terminal, reduce requests, "
+                "or switch to another API key/billing-enabled project."
+            )
+        else:
+            state["ai_reply"] = f"Product analysis error: {e}"
+
+    return state
+
+
 def agent_node(state: AppState) -> AppState:
     """Use the LangChain agent with calculator and notes tools."""
 
@@ -307,6 +374,7 @@ workflow = StateGraph(AppState)
 
 workflow.add_node("pdf", pdf_node)
 workflow.add_node("media", media_node)
+workflow.add_node("product", product_node)
 workflow.add_node("agent", agent_node)
 
 workflow.set_conditional_entry_point(
@@ -314,12 +382,14 @@ workflow.set_conditional_entry_point(
     {
         "pdf": "pdf",
         "media": "media",
+        "product": "product",
         "agent": "agent"
     }
 )
 
 workflow.add_edge("pdf", END)
 workflow.add_edge("media", END)
+workflow.add_edge("product", END)
 workflow.add_edge("agent", END)
 
 app_graph = workflow.compile()
@@ -477,7 +547,8 @@ if user_input:
         "file_type": file_type,
         "vectorstore": vectorstore,
         "media_file": media_file,
-        "ai_reply": ""
+        "ai_reply": "",
+        "product_mode": False
     }
 
     graph_result = app_graph.invoke(graph_input)
